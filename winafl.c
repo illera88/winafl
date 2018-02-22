@@ -504,6 +504,13 @@ recvfrom_interceptor(void *wrapcxt, INOUT void **user_data)
 }
 
 static void
+recv_interceptor(void *wrapcxt, INOUT void **user_data)
+{
+    if (options.debug_mode)
+        dr_fprintf(winafl_data.log, "In recv\n");
+}
+
+static void
 event_module_unload(void *drcontext, const module_data_t *info)
 {
     module_table_unload(module_table, info);
@@ -545,6 +552,8 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
         if (options.debug_mode && (strcmp(module_name, "WS2_32.dll") == 0)) {
             to_wrap = (app_pc)dr_get_proc_address(info->handle, "recvfrom");
             bool result = drwrap_wrap(to_wrap, recvfrom_interceptor, NULL);
+            to_wrap = (app_pc)dr_get_proc_address(info->handle, "recv");
+            result = drwrap_wrap(to_wrap, recv_interceptor, NULL);
         }
 
         if(options.debug_mode && (strcmp(module_name, "KERNEL32.dll") == 0)) {

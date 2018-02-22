@@ -57,7 +57,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#if defined(_WIN32)
 #pragma comment(lib,"ws2_32.lib") //Winsock Library
+#endif
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -83,7 +85,8 @@ static u8 *in_dir,                    /* Input directory with test cases  */
 static u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
 static u32 hang_tmout = EXEC_TIMEOUT; /* Timeout used for hang det (ms)   */
 
-static u8  enable_socket_fuzzing = 0; /* Enable network fuzzing */
+static u8  enable_socket_fuzzing = 0; /* Enable network fuzzing           */
+static u8  is_TCP = 1;                /* TCP or UDP                       */
 static u32 target_port = 0x0;         /* Target port to send test cases   */
 static u32 socket_init_delay = SOCKET_INIT_DELAY; /* Socket init delay    */
 
@@ -2281,6 +2284,7 @@ static int is_child_running() {
 
 
 static void send_data(const char *buf, const int buf_len, int first_time) {
+#if defined(_WIN32)
   static struct sockaddr_in si_other;
   static int s, slen = sizeof(si_other);
   static WSADATA wsa;
@@ -2292,7 +2296,7 @@ static void send_data(const char *buf, const int buf_len, int first_time) {
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
       FATAL("WSAStartup failed. Error Code : %d", WSAGetLastError());
 
-    if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == SOCKET_ERROR)
+    if ((s = socket(AF_INET, is_TCP ? SOCK_STREAM : SOCK_DGRAM, is_TCP ? IPPROTO_IP : IPPROTO_UDP)) == SOCKET_ERROR)
       FATAL("socket() failed with error code : %d", WSAGetLastError());
 
     // setup address structure
@@ -2305,6 +2309,9 @@ static void send_data(const char *buf, const int buf_len, int first_time) {
   // send the data
   if (sendto(s, buf, buf_len, 0, (struct sockaddr *) &si_other, slen) == SOCKET_ERROR)
     FATAL("sendto() failed with error code : %d", WSAGetLastError());
+#else
+    // ToDo: Implement NIX equivalent
+#endif
 }
 
 void open_file_and_send_data() {
@@ -6770,7 +6777,8 @@ static void usage(u8* argv0) {
 
 	   "Network fuzzing settings:\n\n"
 	   "  -a            - IP address to send data in\n"
-	   "  -p            - UDP port to send data in\n"
+     "  -U            - Use UDP (default TCP)\n"
+	   "  -p            - Port to send data in\n"
 	   "  -w            - Delay in milliseconds before start sending data\n"
 
        "Other stuff:\n\n"
@@ -7406,7 +7414,7 @@ int main(int argc, char** argv) {
   dynamorio_dir = NULL;
   client_params = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:a:p:w:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:a:U:p:w:")) > 0)
 
     switch (opt) {
 
@@ -7589,17 +7597,21 @@ int main(int argc, char** argv) {
 
 		break;
 
+    case 'U':
+    is_TCP = 0;
+    break;
+
 	  case 'p':
 
 		enable_socket_fuzzing = 1;
-		if (sscanf(optarg, "%llu", &target_port) < 1 ||
+		if (sscanf(optarg, "%u", &target_port) < 1 ||
 			optarg[0] == '-') FATAL("Bad syntax used for -p");
 
 		break;
 
 	  case 'w':
 
-		if (sscanf(optarg, "%llu", &socket_init_delay) < 1 ||
+		if (sscanf(optarg, "%u", &socket_init_delay) < 1 ||
 			optarg[0] == '-') FATAL("Bad syntax used for -w");
 
 		break;
