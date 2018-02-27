@@ -58,6 +58,7 @@
 #include <sys/types.h>
 
 #if defined(_WIN32)
+
 #pragma comment(lib,"ws2_32.lib") //Winsock Library
 #endif
 
@@ -2282,8 +2283,54 @@ static int is_child_running() {
    return (child_handle && (WaitForSingleObject(child_handle, 0 ) == WAIT_TIMEOUT));
 }
 
+static void send_data_tcp(const char *buf, const int buf_len, int first_time) {
+#if defined(_WIN32)
+  static struct sockaddr_in si_other;
+  static int slen = sizeof(si_other);
+  static WSADATA wsa;
+  int s;
 
-static void send_data(const char *buf, const int buf_len, int first_time) {
+  if (first_time == 0x0) {
+    /* wait while the target process open the socket */
+    Sleep(socket_init_delay);
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+       FATAL("WSAStartup failed. Error Code : %d", WSAGetLastError());
+
+       // setup address structure
+       memset((char *)&si_other, 0, sizeof(si_other));
+       si_other.sin_family = AF_INET;
+       si_other.sin_port = htons(target_port);
+       si_other.sin_addr.S_un.S_addr = inet_addr((char *)target_ip_address);
+    }
+
+    /* In case of TCP we need to open a socket each time we want to establish
+     * connection. In theory we can keep connections always open but it might
+     * cause our target behave differently (probably there are a bunch of
+     * applications where we should apply such scheme to trigger interesting
+     * behavior).
+     */
+    if ((s = socket(AF_INET, SOCK_STREAM, IPPROTO_IP)) == SOCKET_ERROR)
+      FATAL("socket() failed with error code : %d", WSAGetLastError());
+
+    // Connect to server.
+    if (connect(s, (SOCKADDR *)& si_other, slen) == SOCKET_ERROR)
+      FATAL("connect() failed with error code : %d", WSAGetLastError());
+
+    // Send our buffer
+    if (send(s, buf, buf_len, 0) == SOCKET_ERROR)
+      FATAL("send() failed with error code : %d", WSAGetLastError());
+
+    // shutdown the connection since no more data will be sent
+    if (shutdown(s, 0x1/*SD_SEND*/) == SOCKET_ERROR)
+      printf("shutdown failed with error: %d\n", WSAGetLastError());
+
+#else
+	// ToDo: Implement NIX equivalent
+#endif
+}
+
+static void send_data_udp(const char *buf, const int buf_len, int first_time) {
 #if defined(_WIN32)
   static struct sockaddr_in si_other;
   static int s, slen = sizeof(si_other);
@@ -2296,7 +2343,7 @@ static void send_data(const char *buf, const int buf_len, int first_time) {
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
       FATAL("WSAStartup failed. Error Code : %d", WSAGetLastError());
 
-    if ((s = socket(AF_INET, is_TCP ? SOCK_STREAM : SOCK_DGRAM, is_TCP ? IPPROTO_IP : IPPROTO_UDP)) == SOCKET_ERROR)
+    if ((s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == SOCKET_ERROR)
       FATAL("socket() failed with error code : %d", WSAGetLastError());
 
     // setup address structure
@@ -2328,8 +2375,11 @@ void open_file_and_send_data() {
   char *buf = malloc(fsize + 1);
   ck_read(fd, buf, fsize, "input file");
 
-  /* send data over UDP */
-  send_data(buf, fsize, fuzz_iterations_current);
+  /* send data over TCP or UDP */
+  if (is_TCP)
+    send_data_tcp(buf, fsize, fuzz_iterations_current);
+  else
+    send_data_udp(buf, fsize, fuzz_iterations_current);
 
   /* free memory */
   free(buf);
@@ -7414,7 +7464,7 @@ int main(int argc, char** argv) {
   dynamorio_dir = NULL;
   client_params = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:a:U:p:w:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:Ua:p:w:")) > 0)
 
     switch (opt) {
 
@@ -7597,9 +7647,9 @@ int main(int argc, char** argv) {
 
 		break;
 
-    case 'U':
-    is_TCP = 0;
-    break;
+      case 'U':
+        is_TCP = 0;
+        break;
 
 	  case 'p':
 
@@ -7617,7 +7667,7 @@ int main(int argc, char** argv) {
 		break;
 
       default:
-
+        printf("Uknown arg = %s\n", opt);
         usage(argv[0]);
 
     }
