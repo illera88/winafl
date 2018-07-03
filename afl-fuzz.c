@@ -96,6 +96,9 @@ static u32 socket_init_delay = SOCKET_INIT_DELAY; /* Socket init delay    */
 static u8  enable_server_mode = 0;    /* Enable server-mode fuzzing       */
 static u8* server_bind_port = "1337"; /* WinAFL server's default port     */
                                       /* to bind on.                      */
+static u32 encrypt_required = 0;      /* Enable user defined encryption   */
+static u8* lib_name;                  /* The name of the encryption lib   */
+                                      /* to load.                         */
 
 static u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
 
@@ -2367,6 +2370,32 @@ static void send_data_udp(const char *buf, const int buf_len, int first_time) {
 #endif
 }
 
+//Define the function prototypes
+typedef char* (APIENTRY* encrypt_buffer)(char*, int);
+typedef void (APIENTRY* free_buffer)(char*);
+
+// buffer encryption function
+encrypt_buffer encrypt_buffer_ptr = NULL;
+free_buffer free_buffer_ptr = NULL;
+
+char *encrypt_data(char *buf_to_encrypt, int buf_size) {
+  char *result = NULL;
+
+  // If the function address is valid, call the function.
+  result = encrypt_buffer_ptr(buf_to_encrypt, buf_size);
+  if (result == 0)
+    FATAL("Unable to encrypt data case, the user-defined encryption function return NULL");
+
+  /* the encrypt_buffer function should allocate new buffer on heap, we have to free the old one here */
+  free(buf_to_encrypt);
+  return result;
+}
+
+void free_encrypt_data(char *encrypted_buf) {
+  char *result = NULL;
+  free_buffer_ptr(encrypted_buf);
+}
+
 void open_file_and_send_data() {
   /* open generated file */
   s32 fd = out_fd;
@@ -2381,6 +2410,10 @@ void open_file_and_send_data() {
   char *buf = malloc(fsize + 1);
   ck_read(fd, buf, fsize, "input file");
 
+  /* encrypt it if required */
+  if (encrypt_required)
+	  buf = encrypt_data(buf, fsize);
+
   /* send data over TCP or UDP */
   if (is_TCP)
     send_data_tcp(buf, fsize, fuzz_iterations_current);
@@ -2388,7 +2421,10 @@ void open_file_and_send_data() {
     send_data_udp(buf, fsize, fuzz_iterations_current);
 
   /* free memory */
-  free(buf);
+  if (encrypt_required)
+    free_encrypt_data(buf);
+  else
+    free(buf);
 }
 
 int open_file_and_send_response(SOCKET ClientSocket) {
@@ -2405,6 +2441,10 @@ int open_file_and_send_response(SOCKET ClientSocket) {
   char *buf = malloc(fsize + 1);
   ck_read(fd, buf, fsize, "input file");
 
+  /* encrypt it if required */
+  if (encrypt_required)
+	  buf = encrypt_data(buf, fsize);
+
   /* send our test case */
   int iSendResult = send(ClientSocket, buf, fsize, 0);
   if (iSendResult == SOCKET_ERROR) {
@@ -2418,7 +2458,10 @@ int open_file_and_send_response(SOCKET ClientSocket) {
 #endif
 
   /* free memory */
-  free(buf);
+  if (encrypt_required)
+    free_encrypt_data(buf);
+  else
+    free(buf);
 
   return 1;
 }
@@ -7617,6 +7660,20 @@ int getopt(int argc, char **argv, char *optstring) {
   }
 }
 
+void load_crypt_library(const char *libname) {
+  HMODULE hLib = LoadLibraryA(libname);
+  if (hLib == NULL)
+    FATAL("Unable to load crypto library, GetLastError = 0x%x", GetLastError());
+
+  //Get pointer to user-defined encryption function using GetProcAddress:
+  encrypt_buffer_ptr = (encrypt_buffer)GetProcAddress(hLib, "_encrypt_buffer@8");
+  if (encrypt_buffer_ptr == NULL)
+    FATAL("Unable to load encrypt_buffer from encryption DLL provided by user");
+  free_buffer_ptr = (free_buffer)GetProcAddress(hLib, "_free_buffer@4");
+  if (free_buffer_ptr == NULL)
+    FATAL("Unable to load free_buffer from encryption DLL provided by user");
+}
+
 /* Main entry point */
 int main(int argc, char** argv) {
 
@@ -7642,7 +7699,7 @@ int main(int argc, char** argv) {
   dynamorio_dir = NULL;
   client_params = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:Ua:p:w:s:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:Ua:p:w:s:L:")) > 0)
 
     switch (opt) {
 
@@ -7833,7 +7890,6 @@ int main(int argc, char** argv) {
       case 'U':
         is_TCP = 0;
         break;
-
       case 'p':
 
         enable_socket_fuzzing = 1;
@@ -7848,7 +7904,11 @@ int main(int argc, char** argv) {
           optarg[0] == '-') FATAL("Bad syntax used for -w");
 
         break;
+	  case 'L':
+        encrypt_required = 0x1;
+        load_crypt_library(optarg);
 
+        break;
       default:
         printf("Uknown arg = %s\n", opt);
         usage(argv[0]);
