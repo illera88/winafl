@@ -30,6 +30,8 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 
+#define WIN32_LEAN_AND_MEAN /* prevent winsock.h to be included in windows.h */
+
 #define _CRT_RAND_S
 #include <windows.h>
 #include <stdarg.h>
@@ -58,7 +60,8 @@
 #include <sys/types.h>
 
 #if defined(_WIN32)
-
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #pragma comment(lib,"ws2_32.lib") //Winsock Library
 #endif
 
@@ -90,6 +93,9 @@ static u8  enable_socket_fuzzing = 0; /* Enable network fuzzing           */
 static u8  is_TCP = 1;                /* TCP or UDP                       */
 static u32 target_port = 0x0;         /* Target port to send test cases   */
 static u32 socket_init_delay = SOCKET_INIT_DELAY; /* Socket init delay    */
+static u8  enable_server_mode = 0;    /* Enable server-mode fuzzing       */
+static u8* server_bind_port = "1337"; /* WinAFL server's default port     */
+                                      /* to bind on.                      */
 
 static u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
 
@@ -324,7 +330,7 @@ enum {
   /* 05 */ FAULT_NOBITS
 };
 
-
+//#define DEBUG_SERVER 1
 /* Get unix time in milliseconds */
 
 static u64 get_cur_time(void) {
@@ -2323,7 +2329,7 @@ static void send_data_tcp(const char *buf, const int buf_len, int first_time) {
 
     // shutdown the connection since no more data will be sent
     if (shutdown(s, 0x1/*SD_SEND*/) == SOCKET_ERROR)
-      printf("shutdown failed with error: %d\n", WSAGetLastError());
+      FATAL("shutdown failed with error: %d\n", WSAGetLastError());
 
 #else
 	// ToDo: Implement NIX equivalent
@@ -2385,6 +2391,172 @@ void open_file_and_send_data() {
   free(buf);
 }
 
+int open_file_and_send_response(SOCKET ClientSocket) {
+  /* open generated file */
+  s32 fd = out_fd;
+  if (out_file != NULL)
+    fd = open(out_file, O_RDONLY | O_BINARY);
+
+  off_t fsize;
+  fsize = lseek(fd, 0, SEEK_END);
+  lseek(fd, 0, SEEK_SET);
+
+  /* allocate buffer to read the file */
+  char *buf = malloc(fsize + 1);
+  ck_read(fd, buf, fsize, "input file");
+
+  /* send our test case */
+  int iSendResult = send(ClientSocket, buf, fsize, 0);
+  if (iSendResult == SOCKET_ERROR) {
+    FATAL("send failed with error: %d\n", WSAGetLastError());
+    closesocket(ClientSocket);
+    WSACleanup();
+    return 0;
+  }
+#ifdef DEBUG_SERVER
+  SAYF("Bytes sent: %d\n", iSendResult);
+#endif
+
+  /* free memory */
+  free(buf);
+
+  return 1;
+}
+
+#define DEFAULT_BUFLEN 4096
+
+static int recv_loop(SOCKET ClientSocket) {
+  WSADATA wsaData;
+  int iResult;
+  int iSendResult;
+  char recvbuf[DEFAULT_BUFLEN];
+  int recvbuflen = DEFAULT_BUFLEN;
+
+  do {
+    iResult = recv(ClientSocket, recvbuf, recvbuflen, 0);
+    if (iResult > 0) {
+#ifdef DEBUG_SERVER
+      SAYF("Bytes received: %d\n", iResult);
+#endif
+    } else if (iResult == 0) {
+#ifdef DEBUG_SERVER
+      SAYF("Connection closing...\n");
+#endif
+    } else {
+      FATAL("recv failed with error: %d\n", WSAGetLastError());
+      closesocket(ClientSocket);
+      WSACleanup();
+      return 0;
+    }
+  } while (iResult > 0);
+  return 1;
+}
+
+static SOCKET ListenSocket = INVALID_SOCKET;
+static SOCKET ClientSocket = INVALID_SOCKET;
+
+static int initiate_server() {
+  static WSADATA wsaData;
+  static int iResult;
+
+  static struct addrinfo *result = NULL;
+  static struct addrinfo hints;
+  static int iSendResult;
+  static int first_time = 0x1;
+
+  if (!first_time)
+    return 1;
+
+  // Initialize Winsock
+  iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+  if (iResult != 0) {
+    FATAL("WSAStartup failed with error: %d\n", iResult);
+    return 1;
+  }
+
+  ZeroMemory(&hints, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+  hints.ai_flags = AI_PASSIVE;
+
+  // Resolve the server address and port
+  iResult = getaddrinfo(NULL, server_bind_port, &hints, &result);
+  if (iResult != 0) {
+    FATAL("getaddrinfo failed with error: %d\n", iResult);
+    WSACleanup();
+    return 0;
+  }
+
+  // Create a SOCKET for connecting to server
+  ListenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+  if (ListenSocket == INVALID_SOCKET) {
+    FATAL("socket failed with error: %ld\n", WSAGetLastError());
+    freeaddrinfo(result);
+    WSACleanup();
+    return 0;
+  }
+
+  // Setup the TCP listening socket
+  iResult = bind(ListenSocket, result->ai_addr, (int)result->ai_addrlen);
+  if (iResult == SOCKET_ERROR) {
+    FATAL("bind failed with error: %d\n", WSAGetLastError());
+    freeaddrinfo(result);
+    closesocket(ListenSocket);
+    WSACleanup();
+    return 0;
+  }
+
+  freeaddrinfo(result);
+
+  iResult = listen(ListenSocket, SOMAXCONN);
+  if (iResult == SOCKET_ERROR) {
+    FATAL("listen failed with error: %d\n", WSAGetLastError());
+    closesocket(ListenSocket);
+    WSACleanup();
+    return 0;
+  }
+  OKF("WinAFL server is listening on port %s", server_bind_port);
+  first_time = 0x0;
+  return 1;
+}
+
+/* server-mode routings */
+DWORD WINAPI handle_incoming_connection(LPVOID lpParam) {
+  static int iResult;
+#ifdef DEBUG_SERVER
+  SAYF("Handling incoming connections\n");
+#endif
+
+  // Accept a client socket
+  ClientSocket = accept(ListenSocket, NULL, NULL);
+  if (ClientSocket == INVALID_SOCKET) {
+    FATAL("accept failed with error: %d\n", WSAGetLastError());
+    closesocket(ListenSocket);
+    WSACleanup();
+    return 1;
+  }
+
+  recv_loop(ClientSocket);
+  /* answer (fuzz data) to our client */
+  int res = open_file_and_send_response(ClientSocket); 
+
+  if (!res)
+    FATAL("Failed to send response");
+
+  // shutdown the connection since we're done
+  iResult = shutdown(ClientSocket, SD_SEND);
+  if (iResult == SOCKET_ERROR) {
+    FATAL("shutdown failed with error: %d\n", WSAGetLastError());
+    closesocket(ClientSocket);
+    WSACleanup();
+    return 1;
+  }
+
+  return 0;
+}
+
+
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
@@ -2392,7 +2564,7 @@ static u8 run_target(char** argv, u32 timeout) {
   //todo watchdog timer to detect hangs
 
   char command[] = "F";
-  DWORD num_read;
+  DWORD num_read, dwThreadId;
   char result = 0;
 
   if(sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
@@ -2410,13 +2582,19 @@ static u8 run_target(char** argv, u32 timeout) {
     }
   }
 
+  if (enable_server_mode) {
+    if (!initiate_server())
+      return -1;
+    CreateThread(NULL, 0, handle_incoming_connection, NULL, 0, &dwThreadId);
+  }
+
   if(!is_child_running()) {
     destroy_target_process(0);
     create_target_process(argv);
     fuzz_iterations_current = 0;
   }
 
-  if (enable_socket_fuzzing)
+  if (enable_socket_fuzzing && !enable_server_mode) /* in case of server mode we have special thread created below */
     open_file_and_send_data();
 
   child_timed_out = 0;
@@ -7464,7 +7642,7 @@ int main(int argc, char** argv) {
   dynamorio_dir = NULL;
   client_params = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:Ua:p:w:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:Ua:p:w:s:")) > 0)
 
     switch (opt) {
 
@@ -7641,30 +7819,35 @@ int main(int argc, char** argv) {
 
         break;
 
-	  case 'a':
-		enable_socket_fuzzing = 1;
-		target_ip_address = ck_strdup(optarg);
+	    case 'a':
+		    enable_socket_fuzzing = 1;
+		    target_ip_address = ck_strdup(optarg);
 
-		break;
+		    break;
+
+	    case 's':
+        enable_server_mode = 1; /* in this case, port is WinAFL server bind port */
+
+        break;
 
       case 'U':
         is_TCP = 0;
         break;
 
-	  case 'p':
+      case 'p':
 
-		enable_socket_fuzzing = 1;
-		if (sscanf(optarg, "%u", &target_port) < 1 ||
-			optarg[0] == '-') FATAL("Bad syntax used for -p");
+        enable_socket_fuzzing = 1;
+        if (sscanf(optarg, "%u", &target_port) < 1 ||
+          optarg[0] == '-') FATAL("Bad syntax used for -p");
 
-		break;
+        break;
 
-	  case 'w':
+      case 'w':
 
-		if (sscanf(optarg, "%u", &socket_init_delay) < 1 ||
-			optarg[0] == '-') FATAL("Bad syntax used for -w");
+        if (sscanf(optarg, "%u", &socket_init_delay) < 1 ||
+          optarg[0] == '-') FATAL("Bad syntax used for -w");
 
-		break;
+        break;
 
       default:
         printf("Uknown arg = %s\n", opt);
